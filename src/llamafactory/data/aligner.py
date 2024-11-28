@@ -192,7 +192,7 @@ def convert_sharegpt(
             chosen[dataset_attr.role_tag] not in accept_tags[-1]
             or rejected[dataset_attr.role_tag] not in accept_tags[-1]
         ):
-            logger.warning("Invalid role tag in {}.".format([chosen, rejected]))
+            logger.error("Invalid role tag in {}.".format([chosen, rejected]))
             broken_data = True
 
         prompt = aligned_messages
@@ -205,7 +205,7 @@ def convert_sharegpt(
         response = aligned_messages[-1:]
 
     if broken_data:
-        logger.warning("Skipping this abnormal example.")
+        logger.error("Skipping this abnormal example.")
         prompt, response = [], []
 
     convert_images = partial(_convert_images, dataset_attr=dataset_attr, data_args=data_args)

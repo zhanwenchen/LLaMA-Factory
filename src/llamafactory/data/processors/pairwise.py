@@ -77,7 +77,10 @@ def preprocess_pairwise_dataset(
     model_inputs = defaultdict(list)
     for i in range(len(examples["_prompt"])):
         if len(examples["_prompt"][i]) % 2 != 1 or len(examples["_response"][i]) < 2:
-            logger.warning("Dropped invalid example: {}".format(examples["_prompt"][i] + examples["_response"][i]))
+            try:
+                raise ValueError("Dropped invalid example: {}".format(examples["_prompt"][i] + examples["_response"][i]))
+            except ValueError as e:
+                breakpoint()
             continue
 
         chosen_input_ids, chosen_labels, rejected_input_ids, rejected_labels = _encode_pairwise_example(
