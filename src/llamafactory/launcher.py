@@ -14,36 +14,91 @@
 
 import sys
 from typing import Any, Dict, List, Optional
-# from argparse import ArgumentParser, Namespace
 from transformers import TrainerCallback, TrainerControl, TrainerState, TrainingArguments
-from transformers.utils.logging import get_logger
+# from transformers.utils.logging import get_logger
+from logging import getLogger
 from llamafactory.train.tuner import run_exp  # use absolute import
-# from transformers.utils import logging
-# logging.set_verbosity_info()
-
-# from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
-# import os
 
 
 class DynamicSaveStepsCallback(TrainerCallback):
     """
     A callback that manages checkpoint saving based on specified target steps.
 
-    This callback will save checkpoints at specified target steps
-    (e.g., 10, 100, 1000) regardless of the original max_samples_search configuration.
+    This callback will save checkpoints ONLY at specified target steps
+    (e.g., 10, 100, 1000) regardless of the original training configuration.
+    It blocks all other checkpoint saving to ensure no unwanted checkpoints are created.
     """
 
-    def __init__(self, target_steps: List[int]):
+    def __init__(self, target_steps: List[int], logger) -> None:
         """
-        Initialize the DynamicSaveStepsCallback with target steps.
+        Initialize the callback with target steps for checkpoint saving.
 
         Args:
-            target_steps: List of specific steps where we want to save checkpoints
+            target_steps: List of training steps at which checkpoints should be saved.
         """
-        self.target_steps = sorted(target_steps)
-        self.next_save_idx = 0
-        self.logger = get_logger('launcher')
-        self.logger.error(f"launcher: DynamicSaveStepsCallback initialized with target steps: {self.target_steps}")
+        super().__init__()
+        self.target_steps: list[int] = list(dict.fromkeys(target_steps))
+        # self.logger = getLogger("launcher")
+        self.logger = logger
+        self.logger.info(f"DynamicSaveStepsCallback initialized with target steps: {self.target_steps}")
+
+    def on_step_end(
+        self,
+        args: "TrainingArguments",
+        state: "TrainerState",
+        control: "TrainerControl",
+        **kwargs
+    ) -> "TrainerControl":
+        """
+        Called at the beginning of each step to control checkpoint saving.
+
+        This is where we decide if we should allow checkpoint saving for this step,
+        before the trainer has a chance to set should_save.
+
+        Args:
+            args: Training arguments
+            state: Current trainer state
+            control: Control object
+            kwargs: Additional keyword arguments
+
+        Returns:
+            Updated control object
+        """
+        # logger = getLogger("launcher.DynamicSaveStepsCallback.on_step_end")
+        current_step = state.global_step
+        # self.logger.info(f"DynamicSaveStepsCallback.on_step_end: {current_step=}, {self.target_steps=}")
+        # print(f"DynamicSaveStepsCallback.on_step_end: {current_step=}, {self.target_steps=}")
+        # breakpoint()
+        # if current_step in self.target_steps:
+        #     control.should_save = True
+        #     self.logger.info(f"DynamicSaveStepsCallback.on_step_end: Will allow checkpoint save at target step {current_step}")
+        #     return control
+        # if control.should_save is False:
+        #     return control
+        # if current_step in [5, 10, 20, 50]:
+        #     breakpoint()
+        # breakpoint()
+        control.should_save = False
+        # Only allow saving at target steps or the final step
+        if current_step in self.target_steps:
+            control.should_save = True
+            self.logger.info(f"DynamicSaveStepsCallback.on_step_end: Will allow checkpoint. {current_step=}, {self.target_steps=}, {control.should_save=}, {state.max_steps=}")
+            # print(f"DynamicSaveStepsCallback.on_step_end: Will allow checkpoint. {current_step=}, {self.target_steps=}, {control.should_save=}, {state.max_steps=}")
+            return control
+            # Don't modify any existing should_save value - let the trainer decide
+        elif current_step >= state.max_steps:
+            # control.should_save = False
+            # self.logger.info(f"DynamicSaveStepsCallback.on_step_end: Will allow final checkpoint save at step {current_step}")
+            # print(f"DynamicSaveStepsCallback.on_step_end: Will allow final checkpoint save at step {current_step}")
+            return control
+            # Don't modify any existing should_save value - let the trainer decide
+        # else:
+            # Explicitly block saving at other steps
+            # self.logger.error(f"DynamicSaveStepsCallback.on_step_end: Will block checkpoint save at step {current_step} (not a target step)")
+            # print(f"DynamicSaveStepsCallback.on_step_end: Will block checkpoint save at step {current_step} (not a target step)")
+            # control.should_save = False
+
+        return control
 
     def on_save(
         self,
@@ -53,46 +108,36 @@ class DynamicSaveStepsCallback(TrainerCallback):
         **kwargs
     ) -> "TrainerControl":
         """
-        Called when the trainer is about to save a checkpoint.
+        Called after a checkpoint has been saved.
 
-        This method checks if the current step is our next target step to save.
-        If it is, we allow the save to proceed. Otherwise, we check if we need
-        to force a save for our target steps.
+        This method is called after the save has already occurred. We use
+        this mainly for logging purposes.
 
         Args:
             args: Training arguments
             state: Current trainer state
             control: Control object
-            **kwargs: Additional keyword arguments
+            kwargs: Additional keyword arguments
 
         Returns:
-            Control object determining whether a save should happen
+            Updated control object
         """
-        # Skip if we've used all our target steps
-        if self.next_save_idx >= len(self.target_steps):
-            self.logger.error(f"Out of target_steps. {self.next_save_idx=}, {self.target_steps=}")
-            return control
-
         current_step = state.global_step
-        next_target = self.target_steps[self.next_save_idx]
+        # self.logger.info(f"DynamicSaveStepsCallback.on_save: {current_step=}, {self.target_steps=}, {control.should_save=}")
+        # print(f"DynamicSaveStepsCallback.on_save: {current_step=}, {self.target_steps=}, {control.should_save=}")
 
-        # If we've passed our target step without saving, force a save now
-        if current_step >= next_target:
-            self.logger.error(f"launcher: Target step {next_target} reached or passed at step {current_step}, saving checkpoint")
-
-            # Advance to the next target step
-            self.next_save_idx += 1
-
-            # Ensure save happens
-            control.should_save = True
-
-            # If we're at exactly the target step, log it specially
-            if current_step == next_target:
-                self.logger.error(f"launcher: Checkpoint saved at step {current_step} (precise target step)")
+        # Log the save operation
+        if current_step in self.target_steps:
+            self.logger.info(f"DynamicSaveStepsCallback.on_save: Completed checkpoint save at target step {current_step}")
+            # print(f"DynamicSaveStepsCallback.on_save: Completed checkpoint save at target step {current_step}")
+        elif current_step >= state.max_steps:
+            breakpoint()
+            self.logger.info(f"DynamicSaveStepsCallback.on_save: Completed final checkpoint save at step {current_step}")
+            # print(f"DynamicSaveStepsCallback.on_save: Completed final checkpoint save at step {current_step}")
         else:
-            # Skip the save
-            control.should_save = False
-            self.logger.error(f"launcher: Skipping save. {current_step=}, {next_target=}, {self.target_steps=}")
+            # This should not happen if on_step_end is working correctly
+            breakpoint()
+            raise RuntimeError(f"DynamicSaveStepsCallback.on_save: Unexpected checkpoint saved at step {current_step} (not a target step)")
 
         return control
 
@@ -108,22 +153,20 @@ def extract_custom_args() -> List[int]:
     Returns:
         List[int]: The list of target steps parsed from --max_samples_search argument
     """
-    logger = get_logger('launcher')
+    logger = getLogger('launcher')
     target_steps = []
 
     # Look for --max_samples_search argument in sys.argv
     i = 1
-    # breakpoint()
     while i < len(sys.argv):
-        # if sys.argv[i] in ('--max_samples_search', '--max_samples_search_list'):
-        if sys.argv[i] == '--max_samples_search':
+        if sys.argv[i] in ('--max_samples_search', '--orig_max_samples_search'):
             if i + 1 < len(sys.argv):
                 try:
                     # Parse the comma-separated list of steps
                     steps_str = sys.argv[i + 1]
+                    # Ensure we parse all values correctly
                     target_steps = [int(step.strip()) for step in steps_str.split(',')]
-                    logger.error(f"launcher: Parsed custom save steps: {target_steps}")
-
+                    logger.info(f"launcher: Parsed custom save steps: {target_steps}")
                     # Remove both the argument and its value from sys.argv
                     sys.argv.pop(i)  # Remove --max_samples_search
                     sys.argv.pop(i)  # Remove its value
@@ -138,10 +181,16 @@ def extract_custom_args() -> List[int]:
                 continue
         i += 1
 
+    # Ensure we have a complete list of steps
+    if target_steps:
+        logger.error(f"launcher: Will create checkpoints ONLY at steps: {target_steps}")
+    else:
+        logger.warning("launcher: No checkpoint steps provided with --max_samples_search")
+
     return target_steps
 
 
-def launch(args: Optional[Dict[str, Any]] = None, callbacks: List["TrainerCallback"] = []) -> None:
+def launch(args: Optional[Dict[str, Any]] = None, callbacks: Optional[List["TrainerCallback"]] = None) -> None:
     """
     Launch the training experiment with specified args and callbacks.
 
@@ -149,21 +198,22 @@ def launch(args: Optional[Dict[str, Any]] = None, callbacks: List["TrainerCallba
         args: Dictionary of arguments to pass to run_exp
         callbacks: List of callbacks to pass to run_exp
     """
+    callbacks = callbacks or []
     run_exp(args=args, callbacks=callbacks)
 
 
 if __name__ == "__main__":
-    logger = get_logger('launcher')
+    logger = getLogger('launcher')
+
     # Extract and remove custom max_samples_search before LlamaFactory's parser sees it
     target_steps = extract_custom_args()
 
     # Initialize callbacks list
     callbacks = []
 
-    # Add DynamicSaveStepsCallback if target steps were provided
-    # if target_steps:
-    logger.error(f"launcher: Using DynamicSaveStepsCallback with steps: {target_steps}")
-    callbacks.append(DynamicSaveStepsCallback(target_steps=target_steps))
+    # Add DynamicSaveStepsCallback only if target steps were provided
+    # logger.info(f"launcher: Using DynamicSaveStepsCallback with steps: {target_steps}")
+    callbacks.append(DynamicSaveStepsCallback(target_steps=target_steps, logger=logger))
 
     # Launch with remaining args and callbacks
     launch(args=None, callbacks=callbacks)
