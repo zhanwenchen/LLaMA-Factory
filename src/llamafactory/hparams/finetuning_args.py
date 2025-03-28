@@ -131,7 +131,6 @@ class RLHFArguments:
     r"""
     Arguments pertaining to the PPO, DPO and KTO training.
     """
-
     pref_beta: float = field(
         default=0.1,
         metadata={"help": "The beta parameter in the preference loss."},
@@ -204,9 +203,13 @@ class RLHFArguments:
         default=None,
         metadata={"help": "The number of bits to quantize the reward model."},
     )
-    reward_model_type: Literal["lora", "full", "api"] = field(
+    reward_model_type: Literal["lora", "full", "api", "env"] = field(
         default="lora",
-        metadata={"help": "The type of the reward model in PPO training. Lora model only supports lora training."},
+        metadata={"help": "The type of the reward model in PPO training. Lora model only supports lora training. Use 'env' for direct environment rewards."},
+    )
+    use_scienceworld_env: bool = field(
+        default=False,
+        metadata={"help": "Whether to use ScienceWorld environment for direct rewards instead of a separate reward model."},
     )
 
 
@@ -370,8 +373,9 @@ class FinetuningArguments(FreezeArguments, LoraArguments, RLHFArguments, GaloreA
         assert self.ref_model_quantization_bit in [None, 8, 4], "We only accept 4-bit or 8-bit quantization."
         assert self.reward_model_quantization_bit in [None, 8, 4], "We only accept 4-bit or 8-bit quantization."
 
-        if self.stage == "ppo" and self.reward_model is None:
-            raise ValueError("`reward_model` is necessary for PPO training.")
+        # Modify the PPO validation to allow ScienceWorld direct environment rewards
+        if self.stage == "ppo" and self.reward_model is None and not self.use_scienceworld_env and self.reward_model_type != "env":
+            raise ValueError("`reward_model` is necessary for PPO training unless use_scienceworld_env=True or reward_model_type='env'.")
 
         if self.stage == "ppo" and self.reward_model_type == "lora" and self.finetuning_type != "lora":
             raise ValueError("`reward_model_type` cannot be lora for Freeze/Full PPO training.")

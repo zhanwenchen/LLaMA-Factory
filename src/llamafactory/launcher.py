@@ -15,9 +15,13 @@
 import sys
 from typing import Any, Dict, List, Optional
 from transformers import TrainerCallback, TrainerControl, TrainerState, TrainingArguments
+from transformers.utils.logging import set_verbosity_info
 # from transformers.utils.logging import get_logger
 from logging import getLogger
 from llamafactory.train.tuner import run_exp  # use absolute import
+
+
+set_verbosity_info()
 
 
 class DynamicSaveStepsCallback(TrainerCallback):
