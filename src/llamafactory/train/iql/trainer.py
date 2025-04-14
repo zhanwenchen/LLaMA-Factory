@@ -298,12 +298,21 @@ class CustomIQLTrainer(Trainer):
 
         # Get model outputs
         outputs = self.forward_pass(model, batch)
-        logits = outputs.logits
+
+        # Handle different output formats
+        # If outputs is a tuple (older transformer models might return tuples)
+        if isinstance(outputs, tuple):
+            logits = outputs[0]
+            hidden_states = outputs[1] if len(outputs) > 1 else None
+        else:
+            # Standard case where outputs is an object
+            logits = outputs.logits
+            hidden_states = outputs.hidden_states[-1] if hasattr(outputs, "hidden_states") else None
 
         # Extract value and Q-function estimates
         # These would normally come from separate heads in the model
-        state_values = getattr(outputs, "values", None)
-        q_values = getattr(outputs, "q_values", None)
+        state_values = getattr(outputs, "values", None) if not isinstance(outputs, tuple) else None
+        q_values = getattr(outputs, "q_values", None) if not isinstance(outputs, tuple) else None
 
         # Fallback implementation if model doesn't have separate heads
         if state_values is None or q_values is None:
@@ -311,7 +320,12 @@ class CustomIQLTrainer(Trainer):
             if self.ref_model is not None:
                 with torch.no_grad():
                     ref_outputs = self.forward_pass(self.ref_model, batch)
-                    ref_logits = ref_outputs.logits
+
+                    # Handle different output formats for reference model too
+                    if isinstance(ref_outputs, tuple):
+                        ref_logits = ref_outputs[0]
+                    else:
+                        ref_logits = ref_outputs.logits
 
                     # Compute log probabilities from reference model
                     log_probs, valid_length = get_batch_logps(
@@ -331,8 +345,17 @@ class CustomIQLTrainer(Trainer):
             # Simple placeholder implementations if model lacks the proper heads
             # For a full implementation, the model architecture should be modified
             # to include these value and Q-function heads
-            hidden_states = outputs.hidden_states[-1]
-            state_values = torch.mean(hidden_states, dim=1, keepdim=True)
+            if hidden_states is None:
+                # If hidden_states is not available, use the last dimension of logits
+                hidden_states = torch.mean(logits, dim=1)
+
+            # Check if hidden_states is already 2D (batch_size, hidden_size)
+            if hidden_states.dim() > 2:
+                # Average across sequence length to get (batch_size, hidden_size)
+                hidden_states = torch.mean(hidden_states, dim=1)
+
+            # Create simple scalar values from hidden states
+            state_values = torch.mean(hidden_states, dim=-1, keepdim=True)
             q_values = state_values + 0.1  # Simple offset as placeholder
 
         # Compute advantages for policy improvement: Q(s,a) - V(s)
@@ -422,11 +445,12 @@ class CustomIQLTrainer(Trainer):
         # Call standard logging
         super().log(logs)
 
-    def save_model(self, output_dir: Optional[str] = None) -> None:
+    def save_model(self, output_dir: Optional[str] = None, _internal_call: bool = False) -> None:
         """Saves the model checkpoint.
 
         Args:
             output_dir: Directory to save the model to, defaults to args.output_dir
+            _internal_call: Whether this is an internal call to save during training
         """
         if output_dir is None:
             output_dir = self.args.output_dir

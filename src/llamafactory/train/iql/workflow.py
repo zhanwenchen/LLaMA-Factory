@@ -1,129 +1,95 @@
 # workflow.py
 
-from typing import Optional, List, Dict, Any, TYPE_CHECKING, Union
+# Copyright 2024 the LlamaFactory team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-from transformers import TrainingArguments, PreTrainedTokenizerBase
-from transformers.data.data_collator import DataCollatorWithPadding
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
+from ...data import MultiModalDataCollatorForSeq2Seq, get_dataset, get_template_and_fix_tokenizer
+from ...extras.ploting import plot_loss
+from ...model import load_model, load_tokenizer
+from ..trainer_utils import create_modelcard_and_push, create_ref_model
 from .trainer import CustomIQLTrainer
-from ...data import get_dataset, get_template_and_fix_tokenizer
-from ...model import load_model, load_tokenizer, load_adapter
-from ...extras.callbacks import LogCallback
-from ..trainer_utils import create_modelcard_and_push
+
 
 if TYPE_CHECKING:
-    from transformers import PreTrainedModel, TrainerCallback
-    from ...hparams import ModelArguments, DataArguments, FinetuningArguments
+    from transformers import Seq2SeqTrainingArguments, TrainerCallback
+
+    from ...hparams import DataArguments, FinetuningArguments, ModelArguments
 
 
 def run_iql(
     model_args: "ModelArguments",
     data_args: "DataArguments",
-    training_args: TrainingArguments,
+    training_args: "Seq2SeqTrainingArguments",
     finetuning_args: "FinetuningArguments",
     callbacks: Optional[List["TrainerCallback"]] = None,
-) -> "PreTrainedModel":
-    """Run the Implicit Q-Learning (IQL) training process.
-
-    IQL is an offline RL algorithm that learns a policy from a fixed dataset of experiences
-    without explicit policy optimization steps. Instead, it uses conservative Q-learning
-    with value-function-based policy extraction via advantage weighting.
-
-    The workflow follows these steps:
-    1. Load and prepare model, tokenizer, and datasets
-    2. Set up the IQL trainer with all necessary components
-    3. Run training and evaluation
-    4. Save the model and optionally push to Hugging Face Hub
+) -> None:
+    """
+    Run the Implicit Q-Learning (IQL) training process.
 
     Args:
-        model_args: Arguments for model configuration
-        data_args: Arguments for dataset and preprocessing
-        training_args: Arguments for training process
-        finetuning_args: Arguments for fine-tuning method
-        callbacks: Optional list of callbacks for training events
-
-    Returns:
-        The fine-tuned model
+        model_args: Arguments pertaining to model configuration.
+        data_args: Arguments pertaining to data processing.
+        training_args: Arguments pertaining to training configuration.
+        finetuning_args: Arguments pertaining to finetuning configuration.
+        callbacks: Optional list of trainer callbacks.
     """
-    # Load tokenizer and template for data formatting
-    tokenizer = load_tokenizer(model_args)
+    tokenizer_module = load_tokenizer(model_args)
+    tokenizer = tokenizer_module["tokenizer"]
     template = get_template_and_fix_tokenizer(tokenizer, data_args)
+    dataset_module = get_dataset(template, model_args, data_args, training_args, stage="iql", **tokenizer_module)
+    model = load_model(tokenizer, model_args, finetuning_args, training_args.do_train, add_valuehead=True)
 
-    # Load dataset with appropriate transformations for IQL
-    dataset = get_dataset(template, model_args, data_args, training_args, stage="iql")
+    data_collator = MultiModalDataCollatorForSeq2Seq(template=template, **tokenizer_module)
 
-    # Load the base model (policy model)
-    is_trainable = training_args.do_train and not training_args.no_cuda
-    model = load_model(tokenizer, model_args, finetuning_args, is_trainable)
+    # Create reference model if needed
+    ref_model = create_ref_model(model_args, finetuning_args, add_valuehead=True) if finetuning_args.use_ref_model else None
 
-    # Load reference model if specified (typically a pre-trained/SFT model)
-    ref_model = None
-    if finetuning_args.ref_model_name_or_path is not None and finetuning_args.use_ref_model:
-        ref_model = load_model(
-            tokenizer,
-            model_args,
-            finetuning_args,
-            False,  # Reference model doesn't need to be trainable
-            finetuning_args.ref_model_name_or_path
-        )
-        # Load LoRA adapter or other adapters if using parameter-efficient fine-tuning
-        if finetuning_args.finetuning_type != "full" and finetuning_args.ref_adapter_path is not None:
-            ref_model = load_adapter(ref_model, finetuning_args.ref_adapter_path, model_args, finetuning_args)
-
-    # Prepare data collator with appropriate padding
-    data_collator_kwargs: Dict[str, Any] = {
-        "pad_to_multiple_of": 8 if training_args.fp16 or training_args.bf16 else None
-    }
-
-    # Ensure the tokenizer has a pad token
-    if getattr(tokenizer, "pad_token_id", None) is None:
-        tokenizer.pad_token_id = 0  # Use a default value if not set
-
-    data_collator = DataCollatorWithPadding(tokenizer=tokenizer, **data_collator_kwargs)
-
-    # Set up callbacks for logging and other training events
-    if callbacks is None:
-        callbacks = []
-
-    if not any(isinstance(cb, LogCallback) for cb in callbacks):
-        callbacks.append(LogCallback())
-
-    # Initialize the IQL trainer with all components
+    # Initialize our Trainer with all required arguments
     trainer = CustomIQLTrainer(
         model=model,
         ref_model=ref_model,
         args=training_args,
         finetuning_args=finetuning_args,
         data_collator=data_collator,
-        train_dataset=dataset.get("train_dataset"),
-        eval_dataset=dataset.get("eval_dataset"),
+        train_dataset=dataset_module["train_dataset"],
+        eval_dataset=dataset_module.get("eval_dataset", None),
         tokenizer=tokenizer,
-        callbacks=callbacks,
-        # Pass default values for required arguments
         model_init=None,
         compute_metrics=None,
+        callbacks=callbacks,
         optimizers=(None, None),
         preprocess_logits_for_metrics=None,
-        processor=None,
+        processor=tokenizer_module.get("processor", None),
     )
 
-    # Run the IQL training process
+    # Training
     if training_args.do_train:
-        trainer.iql_train(resume_from_checkpoint=training_args.resume_from_checkpoint)
+        train_result = trainer.iql_train(resume_from_checkpoint=training_args.resume_from_checkpoint)
         trainer.save_model()
+        trainer.log_metrics("train", train_result.metrics)
+        trainer.save_metrics("train", train_result.metrics)
         trainer.save_state()
+        if trainer.is_world_process_zero() and finetuning_args.plot_loss:
+            plot_loss(training_args.output_dir, keys=["loss", "eval_loss"])
 
-        # Push to Hugging Face Hub if requested
-        if finetuning_args.push_to_hub:
-            create_modelcard_and_push(
-                model_args,
-                data_args,
-                finetuning_args,
-                training_args
-            )
-
-    # Run evaluation if requested
+    # Evaluation
     if training_args.do_eval:
-        trainer.evaluate()
+        metrics = trainer.evaluate()
+        trainer.log_metrics("eval", metrics)
+        trainer.save_metrics("eval", metrics)
 
-    return model
+    # Create model card
+    create_modelcard_and_push(trainer, model_args, data_args, training_args, finetuning_args)
