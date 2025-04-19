@@ -77,6 +77,7 @@ TRAINING_STAGES = {
     "DPO": "dpo",
     "KTO": "kto",
     "Pre-Training": "pt",
+    "Implicit Q-Learning": "iql",
 }
 
 STAGES_USE_PAIR_DATA = {"rm", "dpo"}
