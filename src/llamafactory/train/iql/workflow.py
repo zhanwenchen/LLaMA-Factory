@@ -13,28 +13,28 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-from typing import TYPE_CHECKING, List, Optional, Tuple
-
-from ...data import MultiModalDataCollatorForSeq2Seq, get_dataset, get_template_and_fix_tokenizer
+from typing import List, Optional
+from accelerate import Accelerator
+from torch.utils.data import DataLoader
+from transformers import Seq2SeqTrainingArguments, TrainerCallback
+from peft import PeftModel
 from ...extras.ploting import plot_loss
+from ...extras import logging
 from ...model import load_model, load_tokenizer
-from ..trainer_utils import create_modelcard_and_push, create_ref_model
 from .trainer import CustomIQLTrainer
+from .utils import load_transitions_from_goldsequences, collate
+from ...hparams import DataArguments, FinetuningArguments, ModelArguments
 
 
-if TYPE_CHECKING:
-    from transformers import Seq2SeqTrainingArguments, TrainerCallback
-
-    from ...hparams import DataArguments, FinetuningArguments, ModelArguments
+logger = logging.get_logger(__name__)
 
 
 def run_iql(
-    model_args: "ModelArguments",
-    data_args: "DataArguments",
-    training_args: "Seq2SeqTrainingArguments",
-    finetuning_args: "FinetuningArguments",
-    callbacks: Optional[List["TrainerCallback"]] = None,
+    model_args: ModelArguments,
+    data_args: DataArguments,
+    training_args: Seq2SeqTrainingArguments,
+    finetuning_args: FinetuningArguments,
+    callbacks: Optional[List[TrainerCallback]] = None,
 ) -> None:
     """
     Run the Implicit Q-Learning (IQL) training process.
@@ -46,50 +46,55 @@ def run_iql(
         finetuning_args: Arguments pertaining to finetuning configuration.
         callbacks: Optional list of trainer callbacks.
     """
+    # Load model and tokenizer
     tokenizer_module = load_tokenizer(model_args)
     tokenizer = tokenizer_module["tokenizer"]
-    template = get_template_and_fix_tokenizer(tokenizer, data_args)
-    dataset_module = get_dataset(template, model_args, data_args, training_args, stage="iql", **tokenizer_module)
-    model = load_model(tokenizer, model_args, finetuning_args, training_args.do_train, add_valuehead=True)
+    transitions = load_transitions_from_goldsequences(data_args.dataset[0])
+    train_dataset = transitions
+    eval_dataset = None  # No evaluation dataset for now
 
-    data_collator = MultiModalDataCollatorForSeq2Seq(template=template, **tokenizer_module)
+    # Load model without value head - our implementation handles value function separately
+    model = load_model(tokenizer, model_args, finetuning_args, training_args.do_train)
 
-    # Create reference model if needed
-    ref_model = create_ref_model(model_args, finetuning_args, add_valuehead=True) if finetuning_args.use_ref_model else None
+    # Log model type for debugging
+    if isinstance(model, PeftModel):
+        logger.info_rank0(f"Using PeftModel type: {type(model).__name__}")
+    else:
+        logger.info_rank0(f"Using model type: {type(model).__name__}")
 
-    # Initialize our Trainer with all required arguments
+    # Initialize the IQL trainer
     trainer = CustomIQLTrainer(
         model=model,
-        ref_model=ref_model,
         args=training_args,
         finetuning_args=finetuning_args,
-        data_collator=data_collator,
-        train_dataset=dataset_module["train_dataset"],
-        eval_dataset=dataset_module.get("eval_dataset", None),
+        data_collator=collate,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
         tokenizer=tokenizer,
-        model_init=None,
-        compute_metrics=None,
+        processor=tokenizer_module["processor"],
         callbacks=callbacks,
-        optimizers=(None, None),
-        preprocess_logits_for_metrics=None,
-        processor=tokenizer_module.get("processor", None),
+        optimizers=(None, None),  # We'll create custom optimizers in the trainer
     )
+
+    batch_size = training_args.per_device_train_batch_size
+    dl: DataLoader = DataLoader(transitions, batch_size=batch_size, shuffle=True, collate_fn=collate, num_workers=32)
+
+    accelerator = Accelerator()
+    trainer, dl, trainer.optimizer, trainer.critic1_optimizer, trainer.critic2_optimizer, trainer.value_optimizer = accelerator.prepare(trainer, dl, trainer.optimizer, trainer.critic1_optimizer, trainer.critic2_optimizer, trainer.value_optimizer)
 
     # Training
     if training_args.do_train:
-        train_result = trainer.iql_train(resume_from_checkpoint=training_args.resume_from_checkpoint)
+        train_result = trainer.train()
         trainer.save_model()
         trainer.log_metrics("train", train_result.metrics)
         trainer.save_metrics("train", train_result.metrics)
         trainer.save_state()
+
         if trainer.is_world_process_zero() and finetuning_args.plot_loss:
-            plot_loss(training_args.output_dir, keys=["loss", "eval_loss"])
+            plot_loss(training_args.output_dir, keys=["loss", "actor_loss", "critic_loss", "value_loss"])
 
     # Evaluation
-    if training_args.do_eval:
+    if training_args.do_eval and eval_dataset is not None:
         metrics = trainer.evaluate()
         trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)
-
-    # Create model card
-    create_modelcard_and_push(trainer, model_args, data_args, training_args, finetuning_args)
